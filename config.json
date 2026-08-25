@@ -1,0 +1,33 @@
+{
+  "port": 3000,
+  "adapter": "hci0",
+  "maximumDisplayRangeMeters": 15,
+  "deviceTimeoutSeconds": 12,
+  "logRecognizedOnly": true,
+  "logRefreshSeconds": 15,
+  "storeRawBluetoothAddress": false,
+  "pathLossExponent": 2.2,
+  "fallbackTxPower": -59,
+  "categories": {
+    "apple": {
+      "label": "Apple Inc.",
+      "color": "#ff4fd8"
+    },
+    "raspberry_pi": {
+      "label": "Raspberry Pi",
+      "color": "#ff3b52"
+    },
+    "samsung": {
+      "label": "Samsung",
+      "color": "#45a3ff"
+    },
+    "android": {
+      "label": "Android (best effort)",
+      "color": "#65ff7a"
+    },
+    "other": {
+      "label": "Unclassified BLE",
+      "color": "#8497a5"
+    }
+  }
+}
