@@ -1,0 +1,223 @@
+package com.tracker;
+
+import org.pcap4j.core.*;
+import org.pcap4j.packet.*;
+import org.pcap4j.packet.namednumber.Dot11FrameType;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class WifiTracker {
+
+    private static final String INTERFACE_NAME = "wlan0";
+    private static final int AGING_TIMEOUT_SECONDS = 60;
+    
+    private static final Map<String, DeviceRecord> deviceMap = new ConcurrentHashMap<>();
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
+
+    // Basic OUI Database for Vendor Identification
+    private static final Map<String, String> OUI_MAP = new HashMap<>();
+    static {
+        OUI_MAP.put("DC:A6:32", "Raspberry Pi");
+        OUI_MAP.put("B8:27:EB", "Raspberry Pi");
+        OUI_MAP.put("00:25:96", "Apple, Inc.");
+        OUI_MAP.put("F8:FF:C2", "Apple, Inc.");
+        OUI_MAP.put("34:FC:B9", "Samsung");
+        OUI_MAP.put("94:E9:79", "Samsung");
+        OUI_MAP.put("00:1D:09", "Dell");
+        OUI_MAP.put("00:14:22", "Dell");
+        OUI_MAP.put("C4:9D:ED", "Intel Corp");
+        OUI_MAP.put("00:15:00", "Intel Corp");
+        OUI_MAP.put("24:0A:C4", "Espressif (IoT)");
+        OUI_MAP.put("CC:50:E3", "Espressif (IoT)");
+    }
+
+    static class DeviceRecord {
+        String mac;
+        String vendor;
+        String type;
+        String info;
+        int rssi;
+        Instant lastSeen;
+
+        public DeviceRecord(String mac, String type, String info, int rssi) {
+            this.mac = mac;
+            this.vendor = resolveVendor(mac);
+            this.type = type;
+            this.info = info;
+            this.rssi = rssi;
+            this.lastSeen = Instant.now();
+        }
+
+        public void update(int rssi, String info) {
+            this.rssi = rssi;
+            this.lastSeen = Instant.now();
+            if (!info.isEmpty() && !info.equals("<Hidden>")) {
+                this.info = info;
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println("Initializing Advanced Wi-Fi Tracker on " + INTERFACE_NAME + "...");
+
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+        
+        // 1. Start Channel Hopper (Runs every 400ms)
+        scheduler.scheduleAtFixedRate(new ChannelHopper(), 0, 400, TimeUnit.MILLISECONDS);
+
+        // 2. Start UI Dashboard (Runs every 1 second)
+        scheduler.scheduleAtFixedRate(WifiTracker::renderDashboard, 1, 1, TimeUnit.SECONDS);
+
+        // 3. Graceful Shutdown Hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("\nShutting down tracker cleanly...");
+            scheduler.shutdownNow();
+        }));
+
+        // 4. Start Pcap Sniffer (Blocking)
+        startSniffer();
+    }
+
+    private static void startSniffer() {
+        try {
+            PcapNetworkInterface nif = Pcaps.getDevByName(INTERFACE_NAME);
+            if (nif == null) {
+                System.err.println("Fatal: Interface " + INTERFACE_NAME + " not found. Is it in monitor mode");
+                System.exit(1);
+            }
+
+            PcapHandle handle = nif.openLive(65536, PcapNetworkInterface.PromiscuousMode.PROMISCUOUS, 50);
+            handle.setFilter("type mgt subtype beacon or type mgt subtype probe-req", BpfProgram.BpfCompileMode.OPTIMIZE);
+
+            handle.loop(-1, (PacketListener) packet -> {
+                try {
+                    processPacket(packet);
+                } catch (Exception ignored) {} // Prevent crashing on malformed packets
+            });
+        } catch (PcapNativeException | NotOpenException | InterruptedException e) {
+            System.err.println("Capture error: " + e.getMessage());
+        }
+    }
+
+    private static void processPacket(Packet packet) {
+        if (!packet.contains(RadiotapPacket.class) || !packet.contains(Dot11Frame.class)) return;
+
+        // Extract RSSI
+        RadiotapPacket.RadiotapHeader radiotap = packet.get(RadiotapPacket.class).getHeader();
+        int rssi = radiotap.getAntennaSignal() != null ? radiotap.getAntennaSignal() : -100;
+
+        // Extract MAC
+        Dot11Frame.Dot11Header dot11 = packet.get(Dot11Frame.class).getHeader();
+        if (dot11.getAddress2() == null) return;
+        String mac = dot11.getAddress2().toString().toUpperCase();
+
+        // Determine Type & Extract SSID
+        Dot11FrameType frameType = dot11.getType();
+        String type = frameType.equals(Dot11FrameType.BEACON) ? "AP (Router)" : "Client Probe";
+        String info = extractSsid(packet.getRawData());
+
+        // Update or Create Record
+        deviceMap.compute(mac, (k, existing) -> {
+            if (existing == null) {
+                return new DeviceRecord(mac, type, info, rssi);
+            } else {
+                existing.update(rssi, info);
+                return existing;
+            }
+        });
+    }
+
+    private static String extractSsid(byte[] raw) {
+        // Robust TLV Parser for 802.11 Information Elements
+        try {
+            for (int i = 24; i < raw.length - 2; ) {
+                int tag = raw[i] & 0xFF;
+                int len = raw[i + 1] & 0xFF;
+                
+                if (tag == 0) { // Tag 0 is always SSID
+                    if (len == 0) return "<Hidden>";
+                    return new String(raw, i + 2, len, StandardCharsets.UTF_8).replaceAll("[^\\x20-\\x7E]", "");
+                }
+                i += 2 + len; // Jump to next tag
+            }
+        } catch (Exception e) {
+            return "<Malformed>";
+        }
+        return "<Hidden>";
+    }
+
+    private static String resolveVendor(String mac) {
+        if (mac.length() >= 8) {
+            String prefix = mac.substring(0, 8);
+            return OUI_MAP.getOrDefault(prefix, "Unknown / Random");
+        }
+        return "Unknown";
+    }
+
+    private static String getSignalMeter(int dbm) {
+        if (dbm >= -50) return "\u001B[32m█████\u001B[0m Logged";
+        if (dbm >= -65) return "\u001B[32m████░\u001B[0m ConnectionStable";
+        if (dbm >= -75) return "\u001B[33m███░░\u001B[0m Low";
+        if (dbm >= -85) return "\u001B[38;5;208m██░░░\u001B[0m Weak";
+        return "\u001B[31m█░░░░\u001B[0m Poor";
+    }
+
+    private static void renderDashboard() {
+        Instant now = Instant.now();
+
+        // 1. Evict Old Devices (Aging)
+        deviceMap.entrySet().removeIf(entry -> 
+            ChronoUnit.SECONDS.between(entry.getValue().lastSeen, now) > AGING_TIMEOUT_SECONDS
+        );
+
+        // 2. Sort by Signal Strength
+        List<DeviceRecord> list = new ArrayList<>(deviceMap.values());
+        list.sort((a, b) -> Integer.compare(b.rssi, a.rssi));
+
+        // 3. Clear Screen & Draw
+        System.out.print("\033[H\033[2J");
+        System.out.flush();
+
+        System.out.println("\u001B[1;36m========================================================================================================\u001B[0m");
+        System.out.println("\u001B[1;37m                               📡 Advanced Wi-Fi Signal Tracker                                         \u001B[0m");
+        System.out.println("\u001B[1;36m========================================================================================================\u001B[0m");
+        System.out.printf("%-18s %-16s %-14s %-24s %-8s %-15s %-10s\n",
+                "MAC Address", "Vendor", "Type", "SSID / Probe Target", "Signal", "Wave", "Last Seen");
+        System.out.println("--------------------------------------------------------------------------------------------------------");
+
+        for (int i = 0; i < Math.min(list.size(), 22); i++) {
+            DeviceRecord d = list.get(i);
+            String safeInfo = d.info.length() > 22 ? d.info.substring(0, 19) + "..." : d.info;
+            String safeVendor = d.vendor.length() > 14 ? d.vendor.substring(0, 11) + "..." : d.vendor;
+            
+            System.out.printf("\u001B[32m%-18s\u001B[0m \u001B[33m%-16s\u001B[0m %-14s \u001B[35m%-24s\u001B[0m %-8s %-24s \u001B[36m%-10s\u001B[0m\n",
+                    d.mac, safeVendor, d.type, safeInfo, d.rssi + "dBm", getSignalMeter(d.rssi), TIME_FMT.format(d.lastSeen));
+        }
+        System.out.println("--------------------------------------------------------------------------------------------------------");
+        System.out.println("Active Targets (Last 60s): " + list.size() + " | Interface: " + INTERFACE_NAME);
+    }
+
+    // Background thread to hop channels
+    static class ChannelHopper implements Runnable {
+        private final int[] channels = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+        private int index = 0;
+
+        @Override
+        public void run() {
+            try {
+                int ch = channels[index % channels.length];
+                new ProcessBuilder("iw", "dev", INTERFACE_NAME, "set", "channel", String.valueOf(ch))
+                        .redirectError(ProcessBuilder.Redirect.DISCARD)
+                        .start();
+                index++;
+            } catch (IOException ignored) {}
+        }
+    }
+}
